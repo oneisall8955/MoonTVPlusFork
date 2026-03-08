@@ -55,8 +55,10 @@ import { usePlaySync } from '@/hooks/usePlaySync';
 import AIChatPanel from '@/components/AIChatPanel';
 import CorrectDialog from '@/components/CorrectDialog';
 import DanmakuFilterSettings from '@/components/DanmakuFilterSettings';
+import DetailPanel from '@/components/DetailPanel';
 import DoubanComments from '@/components/DoubanComments';
 import DownloadEpisodeSelector from '@/components/DownloadEpisodeSelector';
+import Drawer from '@/components/Drawer';
 import EpisodeSelector from '@/components/EpisodeSelector';
 import PageLayout from '@/components/PageLayout';
 import PansouSearch from '@/components/PansouSearch';
@@ -127,6 +129,51 @@ function PlayPageClient() {
 
   // 纠错弹窗状态
   const [showCorrectDialog, setShowCorrectDialog] = useState(false);
+
+  // 详情面板状态
+  const [showDetailPanel, setShowDetailPanel] = useState(false);
+
+  // 大屏设备检测（判断选集面板是否在右侧）
+  const [isLargeScreen, setIsLargeScreen] = useState(false);
+
+  // 检测是否为大屏设备
+  useEffect(() => {
+    const checkScreenSize = () => {
+      setIsLargeScreen(window.innerWidth >= 768); // md断点
+    };
+
+    checkScreenSize();
+    window.addEventListener('resize', checkScreenSize);
+    return () => window.removeEventListener('resize', checkScreenSize);
+  }, []);
+
+  // 抽屉管理：打开指定抽屉时关闭其他抽屉
+  const openDrawer = (drawerName: 'pansou' | 'aiChat' | 'correct' | 'detail') => {
+    if (!isLargeScreen) {
+      // 小屏设备不需要互斥
+      switch (drawerName) {
+        case 'pansou':
+          setShowPansouDialog(true);
+          break;
+        case 'aiChat':
+          setShowAIChat(true);
+          break;
+        case 'correct':
+          setShowCorrectDialog(true);
+          break;
+        case 'detail':
+          setShowDetailPanel(true);
+          break;
+      }
+      return;
+    }
+
+    // 大屏设备：关闭其他抽屉
+    setShowPansouDialog(drawerName === 'pansou');
+    setShowAIChat(drawerName === 'aiChat');
+    setShowCorrectDialog(drawerName === 'correct');
+    setShowDetailPanel(drawerName === 'detail');
+  };
 
   // 检查AI功能是否启用
   useEffect(() => {
@@ -327,6 +374,39 @@ function PlayPageClient() {
       }
 
       try {
+        // 修复anime4k-webgpu库的buffer size限制问题
+        // 在全局层面patch requestAdapter，确保所有adapter都有正确的limits
+        const originalRequestAdapter = (navigator as any).gpu.requestAdapter.bind((navigator as any).gpu);
+
+        (navigator as any).gpu.requestAdapter = async (options?: any) => {
+          const adapter = await originalRequestAdapter(options);
+          if (!adapter) return adapter;
+
+          // 保存原始的requestDevice方法
+          const originalRequestDevice = adapter.requestDevice.bind(adapter);
+
+          // 重写requestDevice方法，添加必要的buffer size限制
+          adapter.requestDevice = async (descriptor?: any) => {
+            const adapterLimits = adapter.limits;
+
+            // 合并用户提供的descriptor和我们需要的limits
+            const enhancedDescriptor = {
+              ...descriptor,
+              requiredLimits: {
+                ...descriptor?.requiredLimits,
+                // 使用adapter支持的最大值，但不超过2GB
+                maxBufferSize: Math.min(adapterLimits.maxBufferSize || 2147483648, 2147483648),
+                maxStorageBufferBindingSize: Math.min(adapterLimits.maxStorageBufferBindingSize || 1073741824, 1073741824),
+              }
+            };
+
+            console.log('WebGPU设备请求配置:', enhancedDescriptor.requiredLimits);
+            return originalRequestDevice(enhancedDescriptor);
+          };
+
+          return adapter;
+        };
+
         const adapter = await (navigator as any).gpu.requestAdapter();
         if (!adapter) {
           setWebGPUSupported(false);
@@ -336,6 +416,10 @@ function PlayPageClient() {
 
         setWebGPUSupported(true);
         console.log('WebGPU支持检测：✅ 支持');
+        console.log('Adapter limits:', {
+          maxBufferSize: adapter.limits.maxBufferSize,
+          maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize
+        });
       } catch (err) {
         setWebGPUSupported(false);
         console.log('WebGPU不支持：', err);
@@ -1230,6 +1314,14 @@ function PlayPageClient() {
     Map<string, { quality: string; loadSpeed: string; pingTime: number; bitrate: string }>
   >(new Map());
 
+  // 当前源的视频信息（用于标题旁边显示）
+  const [currentSourceVideoInfo, setCurrentSourceVideoInfo] = useState<{
+    quality: string;
+    loadSpeed: string;
+    pingTime: number;
+    bitrate: string;
+  } | null>(null);
+
   // 折叠状态（仅在 lg 及以上屏幕有效）
   const [isEpisodeSelectorCollapsed, setIsEpisodeSelectorCollapsed] =
     useState(false);
@@ -1314,6 +1406,27 @@ function PlayPageClient() {
 
     // 无法判断，返回 unknown
     return 'unknown';
+  };
+
+  // 获取当前源的视频信息（分辨率和码率）
+  const fetchCurrentSourceVideoInfo = async () => {
+    if (!detail || !detail.episodes || detail.episodes.length === 0) {
+      return;
+    }
+
+    // 获取当前集数的播放地址
+    const episodeUrl = detail.episodes[currentEpisodeIndex];
+    if (!episodeUrl) {
+      return;
+    }
+
+    try {
+      const info = await getVideoResolutionFromM3u8(episodeUrl, 4000);
+      setCurrentSourceVideoInfo(info);
+    } catch (error) {
+      console.error('获取视频信息失败:', error);
+      setCurrentSourceVideoInfo(null);
+    }
   };
 
   // 播放源优选函数
@@ -1570,6 +1683,117 @@ function PlayPageClient() {
   };
 
   /**
+   * 检查 File System API 本地下载
+   */
+  const checkFileSystemDownload = async (
+    title: string,
+    source?: string,
+    videoId?: string,
+    episodeIndex?: number
+  ): Promise<{ hasLocal: boolean; dirHandle?: FileSystemDirectoryHandle }> => {
+    try {
+      // 从 IndexedDB 读取目录句柄
+      const dbName = 'MoonTVPlus';
+      const storeName = 'dirHandles';
+
+      return new Promise((resolve) => {
+        const request = indexedDB.open(dbName, 2); // 使用版本 2
+
+        request.onupgradeneeded = (event) => {
+          const db = (event.target as IDBOpenDBRequest).result;
+
+          // 创建 dirHandles 表（如果不存在）
+          if (!db.objectStoreNames.contains(storeName)) {
+            db.createObjectStore(storeName);
+          }
+
+          // 创建 activeTasks 表（如果不存在）
+          if (!db.objectStoreNames.contains('activeTasks')) {
+            const activeStore = db.createObjectStore('activeTasks', { keyPath: 'id' });
+            activeStore.createIndex('status', 'status', { unique: false });
+            activeStore.createIndex('createdAt', 'createdAt', { unique: false });
+          }
+
+          // 创建 completedTasks 表（如果不存在）
+          if (!db.objectStoreNames.contains('completedTasks')) {
+            const completedStore = db.createObjectStore('completedTasks', { keyPath: 'id' });
+            completedStore.createIndex('source', 'source', { unique: false });
+            completedStore.createIndex('videoId', 'videoId', { unique: false });
+            completedStore.createIndex('completedAt', 'completedAt', { unique: false });
+            completedStore.createIndex('sourceVideoId', ['source', 'videoId'], { unique: false });
+          }
+        };
+
+        request.onsuccess = async (event) => {
+          const db = (event.target as IDBOpenDBRequest).result;
+
+          // 检查 object store 是否存在
+          if (!db.objectStoreNames.contains(storeName)) {
+            db.close();
+            resolve({ hasLocal: false });
+            return;
+          }
+
+          const transaction = db.transaction([storeName], 'readonly');
+          const store = transaction.objectStore(storeName);
+          const getRequest = store.get('downloadDir');
+
+          getRequest.onsuccess = async () => {
+            const dirHandle = getRequest.result as FileSystemDirectoryHandle | undefined;
+            if (!dirHandle) {
+              resolve({ hasLocal: false });
+              return;
+            }
+
+            try {
+              // 请求读权限
+              const permission = await (dirHandle as any).queryPermission({ mode: 'read' });
+              if (permission !== 'granted') {
+                const requestPermission = await (dirHandle as any).requestPermission({ mode: 'read' });
+                if (requestPermission !== 'granted') {
+                  console.warn('未获得读权限');
+                  resolve({ hasLocal: false });
+                  return;
+                }
+              }
+
+              // 如果有 source、videoId 和 episodeIndex，检查子目录
+              if (source && videoId && episodeIndex !== undefined) {
+                const sourceDirHandle = await dirHandle.getDirectoryHandle(source, { create: false });
+                const videoIdDirHandle = await sourceDirHandle.getDirectoryHandle(videoId, { create: false });
+                const epDirHandle = await videoIdDirHandle.getDirectoryHandle(`ep${episodeIndex + 1}`, { create: false });
+
+                // 检查是否存在 playlist.m3u8 文件
+                await epDirHandle.getFileHandle('playlist.m3u8', { create: false });
+                console.log('找到本地下载文件:', title, `(${source}/${videoId}/ep${episodeIndex + 1})`);
+                resolve({ hasLocal: true, dirHandle: epDirHandle });
+              } else {
+                // 缺少必要参数
+                resolve({ hasLocal: false });
+              }
+            } catch (error) {
+              // 文件不存在
+              console.error('检查本地文件失败:', error);
+              resolve({ hasLocal: false });
+            }
+          };
+
+          getRequest.onerror = () => {
+            resolve({ hasLocal: false });
+          };
+        };
+
+        request.onerror = () => {
+          resolve({ hasLocal: false });
+        };
+      });
+    } catch (error) {
+      console.error('检查 File System API 下载失败:', error);
+      return { hasLocal: false };
+    }
+  };
+
+  /**
    * 刷新xiaoya链接（静默刷新，不改变videoUrl状态）
    * @param hls HLS实例
    * @param video 视频元素
@@ -1805,19 +2029,13 @@ function PlayPageClient() {
     clearRefreshTimer(); // 清除旧的定时器
     isInitialLoadRef.current = true; // 重置为首次加载
 
-    // 动态设置 referrer policy：只在小雅源时不发送 Referer
+    // 动态设置 referrer policy：不发送 Referer
     const existingMeta = document.querySelector('meta[name="referrer"]');
-    if (detailData?.source === 'xiaoya') {
-      if (!existingMeta) {
-        const meta = document.createElement('meta');
-        meta.name = 'referrer';
-        meta.content = 'no-referrer';
-        document.head.appendChild(meta);
-      }
-    } else {
-      if (existingMeta) {
-        existingMeta.remove();
-      }
+    if (!existingMeta) {
+      const meta = document.createElement('meta');
+      meta.name = 'referrer';
+      meta.content = 'no-referrer';
+      document.head.appendChild(meta);
     }
 
     if (
@@ -1866,17 +2084,94 @@ function PlayPageClient() {
       setVideoQualities([]);
     }
 
-    // 检查是否有本地下载的文件
-    const hasLocalFile = await checkLocalDownload(currentSource, currentId, episodeIndex);
+    // 检查是否有 File System API 本地下载的文件
+    const episodeTitle = detailData?.episodes_titles?.[episodeIndex] || `第${episodeIndex + 1}集`;
+    const fileSystemCheck = await checkFileSystemDownload(
+      episodeTitle,
+      currentSource || undefined,
+      currentId || undefined,
+      episodeIndex
+    );
 
-    if (hasLocalFile) {
-      // 使用本地代理接口,URL以.m3u8结尾以便Artplayer自动识别
-      newUrl = `/api/offline-download/local/${currentSource}/${currentId}/${episodeIndex}/playlist.m3u8`;
-      console.log('使用本地下载文件播放:', newUrl);
-    } else if (sourceProxyMode && newUrl) {
-      // 如果视频源启用了代理模式,且不是本地下载,则通过代理播放
-      newUrl = `/api/proxy/vod/m3u8?url=${encodeURIComponent(newUrl)}&source=${encodeURIComponent(currentSource)}`;
-      console.log('使用代理模式播放:', newUrl);
+    if (fileSystemCheck.hasLocal && fileSystemCheck.dirHandle) {
+      // 使用本地文件播放
+      try {
+        // 读取 m3u8 文件
+        const fileHandle = await fileSystemCheck.dirHandle.getFileHandle('playlist.m3u8', { create: false });
+        const file = await fileHandle.getFile();
+        let content = await file.text();
+
+        // 解析 m3u8 文件，为每个 ts 文件创建 Blob URL
+        const lines = content.split('\n');
+        const modifiedLines: string[] = [];
+        const blobUrls: string[] = []; // 保存 Blob URL 以便后续清理
+
+        for (const line of lines) {
+          const trimmedLine = line.trim();
+
+          // 如果是 ts 文件
+          if (trimmedLine.endsWith('.ts')) {
+            try {
+              // 读取 ts 文件
+              const tsFileHandle = await fileSystemCheck.dirHandle.getFileHandle(trimmedLine, { create: false });
+              const tsFile = await tsFileHandle.getFile();
+
+              // 创建 Blob URL
+              const blobUrl = URL.createObjectURL(tsFile);
+              blobUrls.push(blobUrl);
+
+              // 替换为 Blob URL
+              modifiedLines.push(line.replace(trimmedLine, blobUrl));
+            } catch (error) {
+              console.error(`读取 ts 文件失败: ${trimmedLine}`, error);
+              modifiedLines.push(line);
+            }
+          }
+          // 如果是加密密钥
+          else if (trimmedLine.includes('key.key')) {
+            try {
+              const keyFileHandle = await fileSystemCheck.dirHandle.getFileHandle('key.key', { create: false });
+              const keyFile = await keyFileHandle.getFile();
+              const keyBlobUrl = URL.createObjectURL(keyFile);
+              blobUrls.push(keyBlobUrl);
+              modifiedLines.push(line.replace('key.key', keyBlobUrl));
+            } catch (error) {
+              console.error('读取密钥文件失败:', error);
+              modifiedLines.push(line);
+            }
+          }
+          else {
+            modifiedLines.push(line);
+          }
+        }
+
+        // 创建修改后的 m3u8 的 Blob URL
+        const modifiedContent = modifiedLines.join('\n');
+        const m3u8Blob = new Blob([modifiedContent], { type: 'application/vnd.apple.mpegurl' });
+        newUrl = URL.createObjectURL(m3u8Blob);
+
+        // 保存 Blob URLs 到 window，以便在切换视频时清理
+        (window as any).__localFileBlobUrls = blobUrls;
+
+        console.log('使用 File System API 本地文件播放（Blob URL 模式）:', episodeTitle);
+      } catch (error) {
+        console.error('读取本地文件失败:', error);
+      }
+    }
+
+    // 如果没有 File System API 本地文件，检查服务器端本地下载
+    if (!fileSystemCheck.hasLocal) {
+      const hasLocalFile = await checkLocalDownload(currentSource, currentId, episodeIndex);
+
+      if (hasLocalFile) {
+        // 使用本地代理接口,URL以.m3u8结尾以便Artplayer自动识别
+        newUrl = `/api/offline-download/local/${currentSource}/${currentId}/${episodeIndex}/playlist.m3u8`;
+        console.log('使用服务器端本地下载文件播放:', newUrl);
+      } else if (sourceProxyMode && newUrl) {
+        // 如果视频源启用了代理模式,且不是本地下载,则通过代理播放
+        newUrl = `/api/proxy/vod/m3u8?url=${encodeURIComponent(newUrl)}&source=${encodeURIComponent(currentSource)}`;
+        console.log('使用代理模式播放:', newUrl);
+      }
     }
 
     if (newUrl !== videoUrl) {
@@ -1959,7 +2254,11 @@ function PlayPageClient() {
         // M3U8格式 - 使用新的下载器，TS 格式
         try {
           const downloadTitle = `${videoTitle}_第${episodeIndex + 1}集`;
-          await addDownloadTask(proxyUrl, downloadTitle, 'TS');
+          await addDownloadTask(proxyUrl, downloadTitle, 'TS', {
+            source: currentSource || undefined,
+            videoId: currentId || undefined,
+            episodeIndex,
+          });
           successCount++;
         } catch (error) {
           console.error(`添加下载任务失败 (第${episodeIndex + 1}集):`, error);
@@ -3252,6 +3551,13 @@ function PlayPageClient() {
       }
     }
   }, [searchParams, currentSource, currentId, availableSources, currentEpisodeIndex]);
+
+  // 监听 detail 和 currentEpisodeIndex 变化，自动获取视频信息
+  useEffect(() => {
+    if (detail && detail.episodes && detail.episodes.length > 0) {
+      fetchCurrentSourceVideoInfo();
+    }
+  }, [detail, currentEpisodeIndex]);
 
   // 监听 detail 和 currentEpisodeIndex 变化，动态更新字幕
   useEffect(() => {
@@ -4847,7 +5153,7 @@ function PlayPageClient() {
         moreVideoAttr: {
           playsInline: true,
           'webkit-playsinline': 'true',
-          ...(detail?.source === 'xiaoya' ? { referrerpolicy: 'no-referrer' } : {}),
+          referrerpolicy: 'no-referrer',
         } as any,
         // HLS 支持配置
         customType: {
@@ -4907,6 +5213,16 @@ function PlayPageClient() {
 
             const bufferConfig = getBufferConfig(bufferStrategy);
 
+            // 选择合适的 Loader
+            let loaderClass;
+            if (shouldUseCustomLoader) {
+              // 使用自定义广告过滤 Loader
+              loaderClass = CustomHlsJsLoader;
+            } else {
+              // 使用默认 Loader
+              loaderClass = Hls.DefaultConfig.loader;
+            }
+
             const hls = new Hls({
               debug: false, // 关闭日志
               enableWorker: true, // WebWorker 解码，降低主线程压力
@@ -4918,9 +5234,7 @@ function PlayPageClient() {
               maxBufferSize: bufferConfig.maxBufferSize, // 最大缓冲大小
 
               /* 自定义loader */
-              loader: (shouldUseCustomLoader
-                ? CustomHlsJsLoader
-                : Hls.DefaultConfig.loader) as any,
+              loader: loaderClass as any,
             });
 
             hls.loadSource(url);
@@ -5777,6 +6091,85 @@ function PlayPageClient() {
         setPlayerReady(true);
         console.log('[PlayPage] Player ready, triggering sync setup');
 
+        // 应用进度条图标配置 - 尽早执行
+        const applyProgressThumbConfig = () => {
+          try {
+            const config = (window as any).RUNTIME_CONFIG;
+
+            if (!config || config.PROGRESS_THUMB_TYPE === 'default') {
+              // 使用默认样式，移除自定义样式
+              const oldStyle = document.getElementById('custom-progress-thumb-style');
+              if (oldStyle) oldStyle.remove();
+              return;
+            }
+
+            let thumbUrl = '';
+            let thumbColor = '#22c55e'; // 默认绿色
+
+            if (config.PROGRESS_THUMB_TYPE === 'preset' && config.PROGRESS_THUMB_PRESET_ID) {
+              const presetConfig: Record<string, { url: string; color: string }> = {
+                renako: { url: '/icons/q/renako.png', color: '#ec4899' }, // 粉色
+                irena: { url: '/icons/q/irena.png', color: '#f8fafc' }, // 雪白色
+                emilia: { url: '/icons/q/emilia.png', color: '#f8fafc' }, // 雪白色
+              };
+              const preset = presetConfig[config.PROGRESS_THUMB_PRESET_ID];
+              if (preset) {
+                thumbUrl = preset.url;
+                thumbColor = preset.color;
+              }
+            } else if (config.PROGRESS_THUMB_TYPE === 'custom' && config.PROGRESS_THUMB_CUSTOM_URL) {
+              thumbUrl = config.PROGRESS_THUMB_CUSTOM_URL;
+            }
+
+            // 修改 ArtPlayer 的主题色
+            if (artPlayerRef.current) {
+              artPlayerRef.current.theme = thumbColor;
+            }
+
+            if (thumbUrl) {
+              // 根据预设ID确定尺寸
+              let width = '30px';
+              let height = '30px';
+              let marginLeft = '-15px';
+
+              // renako 图标特殊处理（288x404比例，放大1.25倍）
+              if (config.PROGRESS_THUMB_TYPE === 'preset' && config.PROGRESS_THUMB_PRESET_ID === 'renako') {
+                width = '26.875px'; // 21.5 * 1.25
+                height = '37.5px'; // 30 * 1.25
+                marginLeft = '-13.4375px'; // 10.75 * 1.25
+              }
+
+              // 动态设置背景图片
+              const style = document.createElement('style');
+              style.id = 'custom-progress-thumb-style';
+              style.textContent = `
+                /* 替换默认的进度条圆点为自定义图标 */
+                .art-video-player .art-progress-indicator {
+                  width: ${width} !important;
+                  height: ${height} !important;
+                  background-image: url('${thumbUrl}') !important;
+                  background-size: contain !important;
+                  background-repeat: no-repeat !important;
+                  background-position: center !important;
+                  background-color: transparent !important;
+                  border-radius: 0 !important;
+                  margin-left: ${marginLeft} !important;
+                }
+              `;
+
+              // 移除旧样式
+              const oldStyle = document.getElementById('custom-progress-thumb-style');
+              if (oldStyle) oldStyle.remove();
+
+              document.head.appendChild(style);
+            }
+          } catch (error) {
+            console.error('[进度条图标] 应用配置失败:', error);
+          }
+        };
+
+        applyProgressThumbConfig();
+
         // 添加字幕切换功能
         const currentSubtitles = detailRef.current?.subtitles?.[currentEpisodeIndex] || [];
         if (currentSubtitles.length > 0 && artPlayerRef.current) {
@@ -5996,7 +6389,7 @@ function PlayPageClient() {
               saveDanmakuDisplayState(false);
             });
           }
-         
+
         }
 
         // 播放器就绪后，如果正在播放则请求 Wake Lock
@@ -6774,7 +7167,7 @@ function PlayPageClient() {
 
     // 调用异步初始化函数
     initPlayer();
-  }, [videoUrl, loading, blockAdEnabled, currentEpisodeIndex]);
+  }, [videoUrl, loading, blockAdEnabled]);
 
   // 当组件卸载时清理定时器、Wake Lock 和播放器资源
   useEffect(() => {
@@ -7753,7 +8146,7 @@ function PlayPageClient() {
                     <button
                       onClick={(e) => {
                         e.stopPropagation();
-                        setShowPansouDialog(true);
+                        openDrawer('pansou');
                       }}
                       className='flex-shrink-0 hover:opacity-80 transition-opacity'
                       title='搜索网盘资源'
@@ -7765,7 +8158,7 @@ function PlayPageClient() {
                       <button
                         onClick={(e) => {
                           e.stopPropagation();
-                          setShowAIChat(true);
+                          openDrawer('aiChat');
                         }}
                         className='flex-shrink-0 hover:opacity-80 transition-opacity'
                         title='AI问片'
@@ -7773,12 +8166,25 @@ function PlayPageClient() {
                         <Sparkles className='h-6 w-6 text-gray-700 dark:text-gray-300' />
                       </button>
                     )}
+                    {/* 详情按钮 */}
+                    {detail && (
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          openDrawer('detail');
+                        }}
+                        className='flex-shrink-0 hover:opacity-80 transition-opacity px-2 py-1 text-base font-medium text-gray-700 dark:text-gray-300'
+                        title='详情'
+                      >
+                        详
+                      </button>
+                    )}
                     {/* 纠错按钮 - 仅小雅源显示 */}
                     {detail && detail.source === 'xiaoya' && (
                       <button
                         onClick={(e) => {
                           e.stopPropagation();
-                          setShowCorrectDialog(true);
+                          openDrawer('correct');
                         }}
                         className='flex-shrink-0 hover:opacity-80 transition-opacity'
                         title='纠错'
@@ -7866,10 +8272,23 @@ function PlayPageClient() {
                       <span>{doubanYear || detail?.year || videoYear}</span>
                     )}
                     {detail?.source_name && (
-                      <span className={`border px-2 py-[1px] rounded ${
-                        detail.source === 'xiaoya' ? 'border-blue-500' : detail.source === 'openlist' || detail.source === 'emby' || detail.source?.startsWith('emby_') ? 'border-yellow-500' : 'border-gray-500/60'
-                      }`}>
+                      <span
+                        className={`relative group cursor-pointer border px-2 py-[1px] rounded ${
+                          detail.source === 'xiaoya' ? 'border-blue-500' : detail.source === 'openlist' || detail.source === 'emby' || detail.source?.startsWith('emby_') ? 'border-yellow-500' : 'border-gray-500/60'
+                        }`}
+                        onClick={fetchCurrentSourceVideoInfo}
+                      >
                         {detail.source_name}
+                        {/* 视频信息悬浮提示 */}
+                        {currentSourceVideoInfo && (
+                          <div className='absolute bottom-full left-1/2 transform -translate-x-1/2 mb-2 px-3 py-2 bg-gray-800 dark:bg-gray-900 text-white text-sm rounded-lg shadow-xl opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all duration-200 ease-out whitespace-nowrap z-[100] pointer-events-none'>
+                            <div className='text-sm'>
+                              <div>分辨率: {currentSourceVideoInfo.quality}</div>
+                              <div>码率: {currentSourceVideoInfo.bitrate}</div>
+                            </div>
+                            <div className='absolute top-full left-1/2 transform -translate-x-1/2 w-0 h-0 border-l-4 border-r-4 border-t-4 border-transparent border-t-gray-800 dark:border-t-gray-900'></div>
+                          </div>
+                        )}
                       </span>
                     )}
                     {detail?.type_name && <span>{detail.type_name}</span>}
@@ -8016,40 +8435,56 @@ function PlayPageClient() {
 
       {/* 网盘搜索弹窗 */}
       {showPansouDialog && (
-        <div
-          className='fixed inset-0 z-[10000] flex items-center justify-center bg-black/50'
-          onClick={() => setShowPansouDialog(false)}
-        >
-          <div
-            className='relative w-full max-w-4xl max-h-[80vh] overflow-y-auto bg-white dark:bg-gray-900 rounded-lg shadow-xl m-4'
-            onClick={(e) => e.stopPropagation()}
+        isLargeScreen ? (
+          <Drawer
+            isOpen={showPansouDialog}
+            onClose={() => setShowPansouDialog(false)}
+            title={`搜索网盘资源: ${detail?.title || ''}`}
+            width='w-[400px]'
           >
-            {/* 弹窗头部 */}
-            <div className='sticky top-0 z-10 flex items-center justify-between p-4 border-b border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900'>
-              <h2 className='text-xl font-bold text-gray-900 dark:text-gray-100'>
-                搜索网盘资源: {detail?.title || ''}
-              </h2>
-              <button
-                onClick={() => setShowPansouDialog(false)}
-                className='p-2 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-lg transition-colors'
-              >
-                <X className='h-5 w-5 text-gray-600 dark:text-gray-400' />
-              </button>
-            </div>
-
-            {/* 弹窗内容 */}
             <div className='p-4'>
               <PansouSearch
                 keyword={detail?.title || ''}
                 triggerSearch={showPansouDialog}
               />
             </div>
+          </Drawer>
+        ) : (
+          <div
+            className='fixed inset-0 z-[10000] flex items-center justify-center bg-black/50'
+            onClick={() => setShowPansouDialog(false)}
+          >
+            <div
+              className='relative w-full max-w-4xl max-h-[80vh] overflow-y-auto bg-white dark:bg-gray-900 rounded-lg shadow-xl m-4'
+              onClick={(e) => e.stopPropagation()}
+            >
+              {/* 弹窗头部 */}
+              <div className='sticky top-0 z-10 flex items-center justify-between p-4 border-b border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900'>
+                <h2 className='text-xl font-bold text-gray-900 dark:text-gray-100'>
+                  搜索网盘资源: {detail?.title || ''}
+                </h2>
+                <button
+                  onClick={() => setShowPansouDialog(false)}
+                  className='p-2 hover:bg-gray-100 dark:hover:bg-gray-800 rounded-lg transition-colors'
+                >
+                  <X className='h-5 w-5 text-gray-600 dark:text-gray-400' />
+                </button>
+              </div>
+
+              {/* 弹窗内容 */}
+              <div className='p-4'>
+                <PansouSearch
+                  keyword={detail?.title || ''}
+                  triggerSearch={showPansouDialog}
+                />
+              </div>
+            </div>
           </div>
-        </div>
+        )
       )}
 
       {/* AI问片面板 */}
-      {aiEnabled && showAIChat && detail && (
+      {aiEnabled && detail && (
         <AIChatPanel
           isOpen={showAIChat}
           onClose={() => setShowAIChat(false)}
@@ -8060,6 +8495,8 @@ function PlayPageClient() {
             currentEpisode: currentEpisodeIndex + 1,
           }}
           welcomeMessage={aiDefaultMessageWithVideo ? aiDefaultMessageWithVideo.replace('{title}', detail.title || '') : `想了解《${detail.title}》的更多信息吗？我可以帮你查询剧情、演员、评价等。`}
+          useDrawer={isLargeScreen}
+          drawerWidth='w-[400px]'
         />
       )}
 
@@ -8084,6 +8521,57 @@ function PlayPageClient() {
             // 纠错成功后的回调
             handleCorrectSuccess();
           }}
+          useDrawer={isLargeScreen}
+          drawerWidth='w-[400px]'
+        />
+      )}
+
+      {/* 详情面板 */}
+      {detail && (
+        <DetailPanel
+          isOpen={showDetailPanel}
+          onClose={() => setShowDetailPanel(false)}
+          title={detail.title}
+          poster={detail.poster}
+          doubanId={
+            // 特殊源使用 tmdb，其他使用 cms（通过 doubanId）
+            // 如果有豆瓣ID且不为0，传入doubanId
+            detail.source === 'openlist' ||
+            detail.source?.startsWith('emby') ||
+            detail.source === 'xiaoya'
+              ? undefined
+              : detail.douban_id && detail.douban_id !== 0
+              ? detail.douban_id
+              : undefined
+          }
+          tmdbId={
+            // 特殊源使用 tmdb
+            detail.source === 'openlist' ||
+            detail.source?.startsWith('emby') ||
+            detail.source === 'xiaoya'
+              ? detail.tmdb_id
+              : undefined
+          }
+          type={detail.type_name === '电影' ? 'movie' : 'tv'}
+          currentEpisode={currentEpisodeIndex + 1}
+          cmsData={
+            // 非特殊源使用 cms 数据
+            // 但如果有豆瓣ID且不为0，则不传入cmsData，优先使用豆瓣数据
+            detail.source !== 'openlist' &&
+            !detail.source?.startsWith('emby') &&
+            detail.source !== 'xiaoya' &&
+            !(detail.douban_id && detail.douban_id !== 0)
+              ? {
+                  desc: detail.desc,
+                  episodes: detail.episodes,
+                  episodes_titles: detail.episodes_titles,
+                }
+              : undefined
+          }
+          sourceId={detail.id}
+          source={detail.source}
+          useDrawer={isLargeScreen}
+          drawerWidth='w-[400px]'
         />
       )}
     </PageLayout>
